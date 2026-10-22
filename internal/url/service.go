@@ -23,7 +23,7 @@ func NewService(repository Repository) *Service {
 	return &Service{repository: repository}
 }
 
-func (s *Service) Create(ctx context.Context, originalURL string) (ShortURL, error) {
+func (s *Service) Create(ctx context.Context, originalURL, userID string) (ShortURL, error) {
 	originalURL = strings.TrimSpace(originalURL)
 	if err := validateURL(originalURL); err != nil {
 		return ShortURL{}, err
@@ -34,7 +34,7 @@ func (s *Service) Create(ctx context.Context, originalURL string) (ShortURL, err
 		if err != nil {
 			return ShortURL{}, fmt.Errorf("generate code: %w", err)
 		}
-		item, err := s.repository.Create(ctx, code, originalURL)
+		item, err := s.repository.Create(ctx, code, originalURL, userID)
 		if err == nil {
 			return item, nil
 		}
@@ -47,6 +47,18 @@ func (s *Service) Create(ctx context.Context, originalURL string) (ShortURL, err
 
 func (s *Service) FindByCode(ctx context.Context, code string) (ShortURL, error) {
 	return s.repository.FindByCode(ctx, code)
+}
+
+func (s *Service) List(ctx context.Context, userID string, admin bool) ([]ShortURL, error) {
+	return s.repository.List(ctx, userID, admin)
+}
+
+func (s *Service) Disable(ctx context.Context, id, userID string, admin bool) error {
+	return s.repository.Disable(ctx, id, userID, admin)
+}
+
+func (s *Service) Enable(ctx context.Context, id, userID string, admin bool) error {
+	return s.repository.Enable(ctx, id, userID, admin)
 }
 
 func validateURL(value string) error {

@@ -14,6 +14,7 @@ import (
 	"url-shortener/internal/database"
 	apphttp "url-shortener/internal/http"
 	urlservice "url-shortener/internal/url"
+	userservice "url-shortener/internal/user"
 )
 
 func main() {
@@ -30,9 +31,24 @@ func main() {
 	}
 	defer db.Close()
 
+	if cfg.AutoMigrate {
+		if err := database.Migrate(ctx, db, "migrations"); err != nil {
+			logger.Error("database migration failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("database migrations applied")
+	} else {
+		logger.Info("database migrations skipped")
+	}
+
 	repository := urlservice.NewRepository(db)
 	service := urlservice.NewService(repository)
-	handler := apphttp.NewHandler(service, cfg.PublicBaseURL, logger)
+	userRepository := userservice.NewRepository(db)
+	userService := userservice.NewService(userRepository)
+	if cfg.SeedAccounts {
+		seedDefaultAccounts(ctx, userService, cfg, logger)
+	}
+	handler := apphttp.NewHandler(service, userService, cfg.PublicBaseURL, logger)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -56,5 +72,26 @@ func main() {
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
+	}
+}
+
+func seedDefaultAccounts(ctx context.Context, service *userservice.Service, cfg config.Config, logger *slog.Logger) {
+	accounts := []struct {
+		email    string
+		password string
+		role     string
+	}{
+		{cfg.DefaultUserEmail, cfg.DefaultUserPassword, userservice.RoleUser},
+		{cfg.DefaultAdminEmail, cfg.DefaultAdminPassword, userservice.RoleAdmin},
+	}
+	for _, account := range accounts {
+		created, err := service.EnsureDefaultUser(ctx, account.email, account.password, account.role)
+		if err != nil {
+			logger.Error("default account seeding failed", "email", account.email, "role", account.role, "error", err)
+			os.Exit(1)
+		}
+		if created {
+			logger.Info("default account created", "email", account.email, "role", account.role)
+		}
 	}
 }

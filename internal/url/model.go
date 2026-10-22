@@ -7,4 +7,5 @@ type ShortURL struct {
 	Code        string
 	OriginalURL string
 	CreatedAt   time.Time
+	Status      string
 }
