@@ -72,8 +72,11 @@ func newTestHandler(repository *repositoryStub) http.Handler {
 
 func TestCreateEndpointReturnsShortURL(t *testing.T) {
 	handler := newTestHandler(&repositoryStub{})
+	csrfToken := strings.Repeat("a", 64)
 	request := httptest.NewRequest(http.MethodPost, "/api/urls", strings.NewReader(`{"original_url":"https://example.com"}`))
 	request.Header.Set("Content-Type", "application/json")
+	request.AddCookie(&http.Cookie{Name: "csrf", Value: csrfToken})
+	request.Header.Set("X-CSRF-Token", csrfToken)
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -88,7 +91,10 @@ func TestCreateEndpointReturnsShortURL(t *testing.T) {
 
 func TestCreateEndpointRejectsInvalidURL(t *testing.T) {
 	handler := newTestHandler(&repositoryStub{})
+	csrfToken := strings.Repeat("a", 64)
 	request := httptest.NewRequest(http.MethodPost, "/api/urls", strings.NewReader(`{"original_url":"ftp://example.com"}`))
+	request.AddCookie(&http.Cookie{Name: "csrf", Value: csrfToken})
+	request.Header.Set("X-CSRF-Token", csrfToken)
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -98,6 +104,40 @@ func TestCreateEndpointRejectsInvalidURL(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"code":"INVALID_URL"`) {
 		t.Fatalf("response = %q, want INVALID_URL", response.Body.String())
+	}
+}
+
+func TestMutatingRequestRequiresCSRFToken(t *testing.T) {
+	handler := newTestHandler(&repositoryStub{})
+	csrfToken := strings.Repeat("a", 64)
+	request := httptest.NewRequest(http.MethodPost, "/api/urls", strings.NewReader(`{"original_url":"https://example.com"}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), `"code":"CSRF_FAILED"`) {
+		t.Fatalf("without token: status = %d, body = %q; want 403 CSRF_FAILED", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/urls", strings.NewReader(`{"original_url":"https://example.com"}`))
+	request.AddCookie(&http.Cookie{Name: "csrf", Value: csrfToken})
+	request.Header.Set("X-CSRF-Token", csrfToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code == http.StatusForbidden {
+		t.Fatalf("with matching cookie and header: unexpectedly rejected: %q", response.Body.String())
+	}
+}
+
+func TestSecureCookiesCanBeEnabledBehindTLSProxy(t *testing.T) {
+	handler := &Handler{cookieSecure: true}
+	request := httptest.NewRequest(http.MethodPost, "http://localhost/api/auth/logout", nil)
+	if !handler.useSecureCookies(request) {
+		t.Fatal("configured secure cookies are disabled for an HTTP proxy connection")
+	}
+
+	handler.cookieSecure = false
+	request = httptest.NewRequest(http.MethodPost, "https://localhost/api/auth/logout", nil)
+	if !handler.useSecureCookies(request) {
+		t.Fatal("direct TLS request should use secure cookies")
 	}
 }
 
@@ -156,5 +196,20 @@ func TestRateLimitKeepsQRPreviewBucketSeparate(t *testing.T) {
 
 	if response.Code == http.StatusTooManyRequests {
 		t.Fatal("preview requests consumed the general rate limit bucket")
+	}
+}
+
+func TestIsAppPath(t *testing.T) {
+	appPaths := []string{"/login", "/dashboard", "/urls", "/users", "/audit", "/urls/11111111-1111-1111-1111-111111111111"}
+	for _, path := range appPaths {
+		if !isAppPath(path) {
+			t.Errorf("isAppPath(%q) = false, want true", path)
+		}
+	}
+	otherPaths := []string{"/", "/audit-log", "/api/urls", "/healthz"}
+	for _, path := range otherPaths {
+		if isAppPath(path) {
+			t.Errorf("isAppPath(%q) = true, want false", path)
+		}
 	}
 }

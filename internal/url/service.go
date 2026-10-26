@@ -84,7 +84,33 @@ func validateURL(value string) error {
 	return nil
 }
 
+var reservedCodes = map[string]bool{
+	"login":    true,
+	"dashboard": true,
+	"api":      true,
+	"healthz":  true,
+	"static":   true,
+	"audit":    true,
+}
+
+func isReserved(code string) bool {
+	return reservedCodes[code]
+}
+
 func newCode(length int) (string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		candidate, err := randomCode(length)
+		if err != nil {
+			return "", err
+		}
+		if !isReserved(candidate) {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("could not generate a non-reserved code")
+}
+
+func randomCode(length int) (string, error) {
 	result := make([]byte, length)
 	random := make([]byte, length)
 	if _, err := rand.Read(random); err != nil {

@@ -68,3 +68,14 @@ func TestServiceCreateRejectsInvalidURL(t *testing.T) {
 		t.Fatalf("Create() error = %v, want ErrInvalidURL", err)
 	}
 }
+
+func TestIsReservedCode(t *testing.T) {
+	for _, code := range []string{"login", "dashboard", "api", "healthz", "static", "audit"} {
+		if !isReserved(code) {
+			t.Errorf("isReserved(%q) = false, want true", code)
+		}
+	}
+	if isReserved("abc1234") {
+		t.Fatal("isReserved(abc1234) = true, want false")
+	}
+}

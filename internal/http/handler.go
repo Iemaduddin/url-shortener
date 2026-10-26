@@ -2,6 +2,9 @@ package http
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,6 +25,7 @@ type Handler struct {
 	service       *urlservice.Service
 	userService   *userservice.Service
 	publicBaseURL string
+	cookieSecure  bool
 	logger        *slog.Logger
 	audit         auditRecorder
 	qr            *qrservice.Service
@@ -314,10 +318,15 @@ func NewHandlerWithAudit(service *urlservice.Service, userService *userservice.S
 }
 
 func NewHandlerWithOptions(service *urlservice.Service, userService *userservice.Service, publicBaseURL string, logger *slog.Logger, audit auditRecorder, qr *qrservice.Service) http.Handler {
+	return NewHandlerWithCookieSecurity(service, userService, publicBaseURL, logger, audit, qr, false)
+}
+
+func NewHandlerWithCookieSecurity(service *urlservice.Service, userService *userservice.Service, publicBaseURL string, logger *slog.Logger, audit auditRecorder, qr *qrservice.Service, cookieSecure bool) http.Handler {
 	h := &Handler{
 		service:       service,
 		userService:   userService,
 		publicBaseURL: strings.TrimRight(publicBaseURL, "/"),
+		cookieSecure:  cookieSecure,
 		logger:        logger,
 		audit:         audit,
 		qr:            qr,
@@ -335,7 +344,7 @@ func NewHandlerWithOptions(service *urlservice.Service, userService *userservice
 	mux.HandleFunc("/api/users/", h.users)
 	mux.HandleFunc("/api/audit-logs", h.auditLogs)
 	mux.HandleFunc("/qr/", h.qrImage)
-	return securityHeaders(rateLimit(logging(mux, logger)))
+	return securityHeaders(rateLimit(csrf(logging(mux, logger))))
 }
 
 func (h *Handler) qrImage(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +436,7 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func isAppPath(path string) bool {
-	return path == "/dashboard" || path == "/urls" || path == "/users" || strings.HasPrefix(path, "/urls/")
+	return path == "/login" || path == "/dashboard" || path == "/urls" || path == "/users" || path == "/audit" || strings.HasPrefix(path, "/urls/")
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -494,7 +503,12 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Email atau password salah.")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session", Value: session.Token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil, Expires: session.ExpiresAt})
+	if err := h.setCSRFToken(w, r, session.ExpiresAt); err != nil {
+		h.logger.Error("generate CSRF token failed", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "CSRF_TOKEN_FAILED", "Token keamanan gagal dibuat.")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "session", Value: session.Token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: h.useSecureCookies(r), Expires: session.ExpiresAt})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -502,7 +516,8 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie("session"); err == nil {
 		_ = h.userService.Logout(r.Context(), cookie.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: h.useSecureCookies(r)})
+	http.SetCookie(w, &http.Cookie{Name: "csrf", Value: "", Path: "/", MaxAge: -1, SameSite: http.SameSiteLaxMode, Secure: h.useSecureCookies(r)})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -517,8 +532,48 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "Sesi tidak valid.")
 		return
 	}
+	if _, err := r.Cookie("csrf"); err != nil {
+		if h.setCSRFToken(w, r, session.ExpiresAt) != nil {
+			h.writeError(w, http.StatusInternalServerError, "CSRF_TOKEN_FAILED", "Token keamanan gagal dibuat.")
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(authResponse{Role: session.Role})
+}
+
+func (h *Handler) setCSRFToken(w http.ResponseWriter, r *http.Request, expires time.Time) error {
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return err
+	}
+	http.SetCookie(w, &http.Cookie{Name: "csrf", Value: hex.EncodeToString(value), Path: "/", SameSite: http.SameSiteLaxMode, Secure: h.useSecureCookies(r), Expires: expires})
+	return nil
+}
+
+func (h *Handler) useSecureCookies(r *http.Request) bool {
+	return h.cookieSecure || r.TLS != nil
+}
+
+func csrf(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions || r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/register" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		cookie, err := r.Cookie("csrf")
+		header := r.Header.Get("X-CSRF-Token")
+		if err != nil || len(cookie.Value) != 64 || len(header) != len(cookie.Value) || subtle.ConstantTimeCompare([]byte(header), []byte(cookie.Value)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(errorResponse{Error: struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}{Code: "CSRF_FAILED", Message: "Token keamanan tidak valid."}})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) users(w http.ResponseWriter, r *http.Request) {

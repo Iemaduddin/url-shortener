@@ -64,11 +64,16 @@ async function previewErrorMessage(response: Response): Promise<string> {
   return data?.error?.message || "Pratinjau QR gagal diperbarui. Coba lagi.";
 }
 
+function csrfToken(): string {
+  const cookie = document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("csrf="));
+  return cookie ? decodeURIComponent(cookie.slice("csrf=".length)) : "";
+}
+
 async function refreshPreview() {
   if (!props.item) return;
   const request = ++previewRequest;
   try {
-    const response = await fetch(`/api/urls/${props.item.id}/qr/preview`, { method: "PUT", body: qrForm() });
+    const response = await fetch(`/api/urls/${props.item.id}/qr/preview`, { method: "PUT", headers: { "X-CSRF-Token": csrfToken() }, body: qrForm() });
     if (!response.ok) {
       if (request === previewRequest) previewError.value = await previewErrorMessage(response);
       return;

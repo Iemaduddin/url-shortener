@@ -57,6 +57,7 @@ const auditError = ref("");
 const auditPage = ref(1);
 const auditTotalItems = ref(0);
 const auditPageSize = 10;
+const loginReturnPathKey = "shortly-login-return-path";
 
 const activeUrls = computed(() => urls.value.filter((item) => item.status === "active"));
 const disabledUrls = computed(() => urls.value.filter((item) => item.status !== "active"));
@@ -78,6 +79,11 @@ const auditTotalPages = computed(() => Math.max(1, Math.ceil(auditTotalItems.val
 
 function getErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
+}
+
+function csrfToken(): string {
+  const cookie = document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("csrf="));
+  return cookie ? decodeURIComponent(cookie.slice("csrf=".length)) : "";
 }
 
 function navigate(page: Page) {
@@ -248,7 +254,7 @@ async function configureQR(id: string, form: FormData) {
   qrMessage.value = "";
   qrError.value = "";
   try {
-    const response = await fetch(`/api/urls/${id}/qr`, { method: "PUT", body: form });
+    const response = await fetch(`/api/urls/${id}/qr`, { method: "PUT", headers: { "X-CSRF-Token": csrfToken() }, body: form });
     if (!response.ok) {
       const data = (await response.json().catch(() => null)) as APIResponse | null;
       throw new Error(data?.error?.message || "QR code gagal disimpan.");
@@ -267,15 +273,29 @@ async function loadSession() {
   checkingSession.value = true;
   try {
     const response = await fetch("/api/auth/me");
-    if (!response.ok) return;
+    if (!response.ok) {
+      if (window.location.pathname !== "/login") {
+        sessionStorage.setItem(loginReturnPathKey, `${window.location.pathname}${window.location.search}${window.location.hash}`);
+      }
+      if (window.location.pathname !== "/login") {
+        window.history.replaceState({ page: "login" }, "", "/login");
+      }
+      return;
+    }
     const data = (await response.json()) as APIResponse;
     authenticated.value = true;
     role.value = data.role || "user";
-    const requestedPage = pageFromPath(window.location.pathname);
+    const savedPath = sessionStorage.getItem(loginReturnPathKey);
+    const requestedPath = window.location.pathname === "/login"
+      ? (savedPath?.startsWith("/") && !savedPath.startsWith("//") ? savedPath : "/dashboard")
+      : `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    sessionStorage.removeItem(loginReturnPathKey);
+    const requestedPage = pageFromPath(new URL(requestedPath, window.location.origin).pathname);
     currentPage.value = (requestedPage === "users" || requestedPage === "audit") && role.value !== "admin" ? "dashboard" : requestedPage;
-    const detailID = detailIDFromPath(window.location.pathname);
+    const targetPath = new URL(requestedPath, window.location.origin).pathname;
+    const detailID = detailIDFromPath(targetPath);
     if (currentPage.value === "url-detail" && detailID) void loadDetail(detailID);
-    const resolvedPath = currentPage.value === "dashboard" ? "/dashboard" : window.location.pathname;
+    const resolvedPath = currentPage.value === "dashboard" ? "/dashboard" : requestedPath;
     if (window.location.pathname !== resolvedPath) {
       window.history.replaceState({ page: currentPage.value }, "", resolvedPath);
     }
@@ -321,13 +341,14 @@ async function submitAuth() {
 }
 
 async function logout() {
-  await fetch("/api/auth/logout", { method: "POST" });
+  await fetch("/api/auth/logout", { method: "POST", headers: { "X-CSRF-Token": csrfToken() } });
   authenticated.value = false;
   role.value = "user";
   urls.value = [];
   users.value = [];
   currentPage.value = "dashboard";
-  window.history.replaceState({ page: "dashboard" }, "", "/dashboard");
+  sessionStorage.removeItem(loginReturnPathKey);
+  window.history.replaceState({ page: "login" }, "", "/login");
 }
 
 async function createShortUrl() {
@@ -339,7 +360,7 @@ async function createShortUrl() {
   try {
     const response = await fetch("/api/urls", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
       body: JSON.stringify({ original_url: originalUrl.value }),
     });
     const data = (await response.json().catch(() => ({}))) as APIResponse;
@@ -358,7 +379,7 @@ async function createShortUrl() {
 async function disableUrl(id: string) {
   disablingID.value = id;
   try {
-    const response = await fetch(`/api/urls/${id}`, { method: "DELETE" });
+    const response = await fetch(`/api/urls/${id}`, { method: "DELETE", headers: { "X-CSRF-Token": csrfToken() } });
     if (response.ok) {
       urls.value = urls.value.map((item) => item.id === id ? { ...item, status: "disabled" } : item);
       if (detailUrl.value?.id === id) detailUrl.value = { ...detailUrl.value, status: "disabled" };
@@ -371,7 +392,7 @@ async function disableUrl(id: string) {
 async function enableUrl(id: string) {
   disablingID.value = id;
   try {
-    const response = await fetch(`/api/urls/${id}`, { method: "PUT" });
+    const response = await fetch(`/api/urls/${id}`, { method: "PUT", headers: { "X-CSRF-Token": csrfToken() } });
     if (response.ok) {
       urls.value = urls.value.map((item) => item.id === id ? { ...item, status: "active" } : item);
       if (detailUrl.value?.id === id) detailUrl.value = { ...detailUrl.value, status: "active" };
@@ -384,7 +405,7 @@ async function enableUrl(id: string) {
 async function createManagedUser(payload: { email: string; password: string; role: string }) {
   updatingUserID.value = "new";
   try {
-    const response = await fetch("/api/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    const response = await fetch("/api/users", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() }, body: JSON.stringify(payload) });
     if (response.ok) await loadUsers();
   } finally {
     updatingUserID.value = "";
@@ -395,7 +416,7 @@ async function updateManagedUser(user: UserItem, payload: { email: string; passw
   updatingUserID.value = user.id;
   try {
     const response = await fetch(`/api/users/${user.id}`, {
-      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      method: "PATCH", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() }, body: JSON.stringify(payload),
     });
     if (response.ok) await loadUsers();
   } finally {
@@ -408,7 +429,7 @@ async function updateUserStatus(user: UserItem, status: string) {
   try {
     const response = await fetch(`/api/users/${user.id}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken() },
       body: JSON.stringify({ status }),
     });
     if (response.ok) users.value = users.value.map((item) => item.id === user.id ? { ...item, status } : item);
@@ -421,7 +442,7 @@ async function deleteManagedUser(user: UserItem) {
   if (!window.confirm(`Hapus ${user.email} secara permanen?`)) return;
   updatingUserID.value = user.id;
   try {
-    const response = await fetch(`/api/users/${user.id}`, { method: "DELETE" });
+    const response = await fetch(`/api/users/${user.id}`, { method: "DELETE", headers: { "X-CSRF-Token": csrfToken() } });
     if (response.ok) users.value = users.value.filter((item) => item.id !== user.id);
   } finally {
     updatingUserID.value = "";
@@ -435,6 +456,11 @@ async function copyText(value: string) {
 
 onMounted(() => {
   window.addEventListener("popstate", () => {
+    if (!authenticated.value && window.location.pathname !== "/login") {
+      sessionStorage.setItem(loginReturnPathKey, `${window.location.pathname}${window.location.search}${window.location.hash}`);
+      window.history.replaceState({ page: "login" }, "", "/login");
+      return;
+    }
     const page = pageFromPath(window.location.pathname);
     if (page !== "users" || role.value === "admin") {
       currentPage.value = page;

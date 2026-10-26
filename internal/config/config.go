@@ -9,6 +9,7 @@ type Config struct {
 	HTTPAddr             string
 	DatabaseURL          string
 	PublicBaseURL        string
+	CookieSecure         bool
 	AutoMigrate          bool
 	SeedAccounts         bool
 	DefaultUserEmail     string
@@ -22,6 +23,7 @@ func Load() Config {
 		HTTPAddr:             valueOrDefault("HTTP_ADDR", ":8080"),
 		DatabaseURL:          valueOrDefault("DATABASE_URL", "postgres://postgres:12345@localhost:5432/url_shortener?sslmode=disable"),
 		PublicBaseURL:        valueOrDefault("PUBLIC_BASE_URL", "http://localhost:8080"),
+		CookieSecure:         boolOrDefault("COOKIE_SECURE", false),
 		AutoMigrate:          boolOrDefault("AUTO_MIGRATE", true),
 		SeedAccounts:         boolOrDefault("SEED_DEFAULT_ACCOUNTS", true),
 		DefaultUserEmail:     valueOrDefault("DEFAULT_USER_EMAIL", "user@example.com"),

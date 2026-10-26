@@ -50,7 +50,7 @@ func main() {
 	if cfg.SeedAccounts {
 		seedDefaultAccounts(ctx, userService, cfg, logger)
 	}
-	handler := apphttp.NewHandlerWithOptions(service, userService, cfg.PublicBaseURL, logger, audit.NewRepository(db), qrservice.NewService(qrservice.NewRepository(db)))
+	handler := apphttp.NewHandlerWithCookieSecurity(service, userService, cfg.PublicBaseURL, logger, audit.NewRepository(db), qrservice.NewService(qrservice.NewRepository(db)), cfg.CookieSecure)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

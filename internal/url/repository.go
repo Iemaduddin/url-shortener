@@ -24,11 +24,9 @@ func (r *postgresRepository) FindByID(ctx context.Context, id, userID string, ad
 	var item ShortURL
 	err := r.db.QueryRow(ctx, `
 		SELECT s.id, s.code, s.original_url, s.created_at, s.status,
-			COUNT(c.id), MAX(c.clicked_at)
+			s.total_clicks, s.last_clicked_at
 		FROM short_urls s
-		LEFT JOIN click_events c ON c.short_url_id = s.id
 		WHERE s.id = $1::uuid AND ($2::boolean OR s.user_id = NULLIF($3, '')::uuid)
-		GROUP BY s.id
 	`, id, admin, userID).Scan(
 		&item.ID, &item.Code, &item.OriginalURL, &item.CreatedAt,
 		&item.Status, &item.TotalClicks, &item.LastClicked,
@@ -61,13 +59,11 @@ func (r *postgresRepository) List(ctx context.Context, userID string, admin bool
 	offset := (page - 1) * pageSize
 	query := `
 		SELECT s.id, s.code, s.original_url, s.created_at, s.status,
-			COUNT(c.id) AS total_clicks, MAX(c.clicked_at) AS last_clicked
+			s.total_clicks, s.last_clicked_at
 		FROM short_urls s
-		LEFT JOIN click_events c ON c.short_url_id = s.id
 		WHERE ($1::boolean OR s.user_id = $2::uuid)
 			AND ($3 = '' OR s.code ILIKE '%' || $3 || '%' OR s.original_url ILIKE '%' || $3 || '%')
 			AND ($4 = '' OR s.status = $4)
-		GROUP BY s.id
 		ORDER BY s.created_at DESC
 		LIMIT $5 OFFSET $6`
 	rows, err := r.db.Query(ctx, query, admin, userID, search, status, pageSize, offset)
