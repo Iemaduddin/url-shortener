@@ -24,8 +24,12 @@ func (r *repositoryStub) FindByCode(context.Context, string) (ShortURL, error) {
 	return r.created, nil
 }
 
-func (r *repositoryStub) List(context.Context, string, bool) ([]ShortURL, error) {
-	return []ShortURL{r.created}, r.err
+func (r *repositoryStub) List(context.Context, string, bool, int, int, string, string) ([]ShortURL, int, error) {
+	return []ShortURL{r.created}, 1, r.err
+}
+
+func (r *repositoryStub) FindByID(context.Context, string, string, bool) (ShortURL, error) {
+	return r.created, r.err
 }
 
 func (r *repositoryStub) Disable(context.Context, string, string, bool) error {
@@ -33,6 +37,10 @@ func (r *repositoryStub) Disable(context.Context, string, string, bool) error {
 }
 
 func (r *repositoryStub) Enable(context.Context, string, string, bool) error {
+	return r.err
+}
+
+func (r *repositoryStub) RecordClick(context.Context, string, string, string) error {
 	return r.err
 }
 

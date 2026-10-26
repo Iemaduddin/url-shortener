@@ -54,8 +54,8 @@ func (s *Service) EnsureDefaultUser(ctx context.Context, email, password, role s
 	return s.repository.EnsureUser(ctx, email, string(hash), role)
 }
 
-func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
-	return s.repository.ListUsers(ctx)
+func (s *Service) ListUsers(ctx context.Context, page, pageSize int, search string) ([]User, int, error) {
+	return s.repository.ListUsers(ctx, page, pageSize, search)
 }
 
 func (s *Service) CreateManagedUser(ctx context.Context, email, password, role string) (User, error) {

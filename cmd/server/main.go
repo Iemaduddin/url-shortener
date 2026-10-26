@@ -10,9 +10,11 @@ import (
 	"syscall"
 	"time"
 
+	"url-shortener/internal/audit"
 	"url-shortener/internal/config"
 	"url-shortener/internal/database"
 	apphttp "url-shortener/internal/http"
+	qrservice "url-shortener/internal/qr"
 	urlservice "url-shortener/internal/url"
 	userservice "url-shortener/internal/user"
 )
@@ -48,7 +50,7 @@ func main() {
 	if cfg.SeedAccounts {
 		seedDefaultAccounts(ctx, userService, cfg, logger)
 	}
-	handler := apphttp.NewHandler(service, userService, cfg.PublicBaseURL, logger)
+	handler := apphttp.NewHandlerWithOptions(service, userService, cfg.PublicBaseURL, logger, audit.NewRepository(db), qrservice.NewService(qrservice.NewRepository(db)))
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

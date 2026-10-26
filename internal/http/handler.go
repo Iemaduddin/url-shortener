@@ -1,13 +1,19 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"url-shortener/internal/audit"
+	qrservice "url-shortener/internal/qr"
 	urlservice "url-shortener/internal/url"
 	userservice "url-shortener/internal/user"
 )
@@ -17,6 +23,13 @@ type Handler struct {
 	userService   *userservice.Service
 	publicBaseURL string
 	logger        *slog.Logger
+	audit         auditRecorder
+	qr            *qrservice.Service
+}
+
+type auditRecorder interface {
+	Record(context.Context, audit.Event) error
+	List(context.Context, int, int) ([]audit.Log, int, error)
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
@@ -24,7 +37,8 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	items, err := h.service.List(r.Context(), session.UserID, session.Role == userservice.RoleAdmin)
+	page, pageSize := pagination(r)
+	items, total, err := h.service.List(r.Context(), session.UserID, session.Role == userservice.RoleAdmin, page, pageSize, r.URL.Query().Get("search"), r.URL.Query().Get("status"))
 	if err != nil {
 		h.logger.Error("list short URLs failed", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "LIST_FAILED", "Daftar URL gagal dimuat.")
@@ -35,14 +49,34 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		response = append(response, urlItemResponse{
 			ID: item.ID, Code: item.Code, ShortURL: h.publicBaseURL + "/" + item.Code,
 			OriginalURL: item.OriginalURL, CreatedAt: item.CreatedAt, Status: item.Status,
+			TotalClicks: item.TotalClicks, LastClicked: item.LastClicked,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(urlListResponse{Items: response, Page: page, PageSize: pageSize, TotalItems: total})
+}
+
+type urlListResponse struct {
+	Items      []urlItemResponse `json:"items"`
+	Page       int               `json:"page"`
+	PageSize   int               `json:"page_size"`
+	TotalItems int               `json:"total_items"`
+}
+
+func pagination(r *http.Request) (int, int) {
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 50 {
+		pageSize = 10
+	}
+	return page, pageSize
 }
 
 func (h *Handler) urlAction(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete && r.Method != http.MethodPut {
+	if r.Method != http.MethodGet && r.Method != http.MethodDelete && r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -51,8 +85,110 @@ func (h *Handler) urlAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/api/urls/")
-	if id == "" || strings.Contains(id, "/") {
+	isQRPreview := strings.HasSuffix(id, "/qr/preview")
+	isQR := isQRPreview || strings.HasSuffix(id, "/qr")
+	if id == "" || (strings.Contains(id, "/") && !isQR) {
 		http.NotFound(w, r)
+		return
+	}
+	if isQRPreview {
+		id = strings.TrimSuffix(id, "/qr/preview")
+		if r.Method != http.MethodPut || h.qr == nil || !isUUID(id) {
+			http.NotFound(w, r)
+			return
+		}
+	} else if isQR {
+		id = strings.TrimSuffix(id, "/qr")
+		if (r.Method != http.MethodPut && r.Method != http.MethodGet) || h.qr == nil || !isUUID(id) {
+			http.NotFound(w, r)
+			return
+		}
+	} else if r.Method == http.MethodGet && !isUUID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	if isQR {
+		item, err := h.service.FindByID(r.Context(), id, session.UserID, session.Role == userservice.RoleAdmin)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodGet {
+			saved, err := h.qr.GetConfig(r.Context(), id)
+			if errors.Is(err, qrservice.ErrNotFound) {
+				if _, genErr := h.qr.Generate(r.Context(), id, h.publicBaseURL+"/"+item.Code, qrservice.Config{}); genErr != nil {
+					h.logger.Error("generate missing qr config failed", "error", genErr)
+					h.writeError(w, http.StatusInternalServerError, "QR_CONFIG_FAILED", "QR code gagal dimuat.")
+					return
+				}
+				saved, err = h.qr.GetConfig(r.Context(), id)
+			}
+			if err != nil {
+				h.logger.Error("get qr config failed", "error", err)
+				h.writeError(w, http.StatusInternalServerError, "QR_CONFIG_FAILED", "QR code gagal dimuat.")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(qrConfigResponse{
+				Foreground: saved.Foreground,
+				Background: saved.Background,
+				FrameText:  saved.FrameText,
+				HasLogo:    saved.HasLogo,
+				UpdatedAt:  saved.UpdatedAt,
+			})
+			return
+		}
+		if err := r.ParseMultipartForm(5 * 1024 * 1024); err != nil {
+			h.writeError(w, http.StatusBadRequest, "INVALID_QR_REQUEST", "File QR tidak valid.")
+			return
+		}
+		file, _, err := r.FormFile("logo")
+		var logo []byte
+		if err == nil {
+			defer file.Close()
+			logo, err = io.ReadAll(io.LimitReader(file, 5*1024*1024+1))
+		}
+		if err != nil && !errors.Is(err, http.ErrMissingFile) {
+			h.writeError(w, http.StatusBadRequest, "INVALID_LOGO", "Logo tidak dapat dibaca.")
+			return
+		}
+		config := qrservice.Config{Foreground: r.FormValue("foreground"), Background: r.FormValue("background"), FrameText: r.FormValue("frame_text"), Logo: logo}
+		if len(logo) == 0 {
+			config.Logo = h.storedLogo(r.Context(), id)
+		}
+		value := h.publicBaseURL + "/" + item.Code
+		var pngData []byte
+		if isQRPreview {
+			pngData, err = h.qr.Preview(value, config)
+		} else {
+			pngData, err = h.qr.Generate(r.Context(), id, value, config)
+		}
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, "INVALID_QR", err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		if isQRPreview {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		_, _ = w.Write(pngData)
+		return
+	}
+	if r.Method == http.MethodGet {
+		item, err := h.service.FindByID(r.Context(), id, session.UserID, session.Role == userservice.RoleAdmin)
+		if errors.Is(err, urlservice.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+
+		if err != nil {
+			h.logger.Error("get short URL failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "DETAIL_FAILED", "Detail URL gagal dimuat.")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(h.urlResponse(item))
 		return
 	}
 	var err error
@@ -61,6 +197,7 @@ func (h *Handler) urlAction(w http.ResponseWriter, r *http.Request) {
 	} else {
 		err = h.service.Disable(r.Context(), id, session.UserID, session.Role == userservice.RoleAdmin)
 	}
+
 	if errors.Is(err, urlservice.ErrNotFound) {
 		http.NotFound(w, r)
 		return
@@ -71,6 +208,42 @@ func (h *Handler) urlAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	h.recordAudit(r.Context(), audit.Event{ActorUserID: session.UserID, Action: "url.status_changed", ResourceType: "short_url", ResourceID: id, Metadata: map[string]string{"method": r.Method}})
+}
+
+func (h *Handler) urlResponse(item urlservice.ShortURL) urlItemResponse {
+	return urlItemResponse{
+		ID: item.ID, Code: item.Code, ShortURL: h.publicBaseURL + "/" + item.Code,
+		OriginalURL: item.OriginalURL, CreatedAt: item.CreatedAt, Status: item.Status,
+		TotalClicks: item.TotalClicks, LastClicked: item.LastClicked,
+	}
+}
+
+func (h *Handler) storedLogo(ctx context.Context, id string) []byte {
+	logo, err := h.qr.GetLogo(ctx, id)
+	if err != nil && !errors.Is(err, qrservice.ErrNotFound) {
+		h.logger.Error("get stored qr logo failed", "url_id", id, "error", err)
+		return nil
+	}
+	return logo
+}
+
+func isUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index, char := range value {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			if char != '-' {
+				return false
+			}
+			continue
+		}
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 type createURLRequest struct {
@@ -82,12 +255,22 @@ type createURLResponse struct {
 }
 
 type urlItemResponse struct {
-	ID          string    `json:"id"`
-	Code        string    `json:"code"`
-	ShortURL    string    `json:"short_url"`
-	OriginalURL string    `json:"original_url"`
-	CreatedAt   time.Time `json:"created_at"`
-	Status      string    `json:"status"`
+	ID          string     `json:"id"`
+	Code        string     `json:"code"`
+	ShortURL    string     `json:"short_url"`
+	OriginalURL string     `json:"original_url"`
+	CreatedAt   time.Time  `json:"created_at"`
+	Status      string     `json:"status"`
+	TotalClicks int64      `json:"total_clicks"`
+	LastClicked *time.Time `json:"last_clicked_at,omitempty"`
+}
+
+type qrConfigResponse struct {
+	Foreground string    `json:"foreground"`
+	Background string    `json:"background"`
+	FrameText  string    `json:"frame_text"`
+	HasLogo    bool      `json:"has_logo"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type errorResponse struct {
@@ -110,17 +293,34 @@ type userItemResponse struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type userListResponse struct {
+	Items      []userItemResponse `json:"items"`
+	Page       int                `json:"page"`
+	PageSize   int                `json:"page_size"`
+	TotalItems int                `json:"total_items"`
+}
+
 type authRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
 func NewHandler(service *urlservice.Service, userService *userservice.Service, publicBaseURL string, logger *slog.Logger) http.Handler {
+	return NewHandlerWithOptions(service, userService, publicBaseURL, logger, nil, nil)
+}
+
+func NewHandlerWithAudit(service *urlservice.Service, userService *userservice.Service, publicBaseURL string, logger *slog.Logger, audit auditRecorder) http.Handler {
+	return NewHandlerWithOptions(service, userService, publicBaseURL, logger, audit, nil)
+}
+
+func NewHandlerWithOptions(service *urlservice.Service, userService *userservice.Service, publicBaseURL string, logger *slog.Logger, audit auditRecorder, qr *qrservice.Service) http.Handler {
 	h := &Handler{
 		service:       service,
 		userService:   userService,
 		publicBaseURL: strings.TrimRight(publicBaseURL, "/"),
 		logger:        logger,
+		audit:         audit,
+		qr:            qr,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.route)
@@ -133,7 +333,73 @@ func NewHandler(service *urlservice.Service, userService *userservice.Service, p
 	mux.HandleFunc("/api/auth/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
 	mux.HandleFunc("/api/users/", h.users)
-	return logging(mux, logger)
+	mux.HandleFunc("/api/audit-logs", h.auditLogs)
+	mux.HandleFunc("/qr/", h.qrImage)
+	return securityHeaders(rateLimit(logging(mux, logger)))
+}
+
+func (h *Handler) qrImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || h.qr == nil {
+		http.NotFound(w, r)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/qr/")
+	id = strings.TrimSuffix(id, ".png")
+	if !isUUID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	item, err := h.service.FindPublicByID(r.Context(), id)
+	if errors.Is(err, urlservice.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		h.logger.Error("find short URL for qr failed", "error", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	pngData, err := h.qr.Get(r.Context(), id)
+	if errors.Is(err, qrservice.ErrNotFound) {
+		pngData, err = h.qr.Generate(r.Context(), id, h.publicBaseURL+"/"+item.Code, qrservice.Config{})
+	}
+	if err != nil {
+		h.logger.Error("get qr code failed", "error", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(pngData)
+}
+
+func (h *Handler) auditLogs(w http.ResponseWriter, r *http.Request) {
+	session, ok := h.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if session.Role != userservice.RoleAdmin || h.audit == nil {
+		h.writeError(w, http.StatusForbidden, "FORBIDDEN", "Akses admin diperlukan.")
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	page, pageSize := pagination(r)
+	items, total, err := h.audit.List(r.Context(), page, pageSize)
+	if err != nil {
+		h.logger.Error("list audit logs failed", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "AUDIT_LIST_FAILED", "Audit log gagal dimuat.")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Items      []audit.Log `json:"items"`
+		Page       int         `json:"page"`
+		PageSize   int         `json:"page_size"`
+		TotalItems int         `json:"total_items"`
+	}{items, page, pageSize, total})
 }
 
 func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +427,7 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func isAppPath(path string) bool {
-	return path == "/dashboard" || path == "/urls" || path == "/users"
+	return path == "/dashboard" || path == "/urls" || path == "/users" || strings.HasPrefix(path, "/urls/")
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +458,12 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(createURLResponse{ShortURL: h.publicBaseURL + "/" + item.Code})
+	if h.qr != nil {
+		if _, err := h.qr.Generate(r.Context(), item.ID, h.publicBaseURL+"/"+item.Code, qrservice.Config{}); err != nil {
+			h.logger.Error("generate qr code failed", "url_id", item.ID, "error", err)
+		}
+	}
+	h.recordAudit(r.Context(), audit.Event{ActorUserID: h.userID(r), Action: "url.created", ResourceType: "short_url", ResourceID: item.ID})
 }
 
 func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +556,8 @@ func (h *Handler) users(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	items, err := h.userService.ListUsers(r.Context())
+	page, pageSize := pagination(r)
+	items, total, err := h.userService.ListUsers(r.Context(), page, pageSize, strings.TrimSpace(r.URL.Query().Get("search")))
 	if err != nil {
 		h.logger.Error("list users failed", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "LIST_USERS_FAILED", "Daftar user gagal dimuat.")
@@ -296,7 +569,7 @@ func (h *Handler) users(w http.ResponseWriter, r *http.Request) {
 		response = append(response, userItemResponse{ID: item.ID, Email: item.Email, Role: item.Role, Status: item.Status, CreatedAt: item.CreatedAt})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(userListResponse{Items: response, Page: page, PageSize: pageSize, TotalItems: total})
 }
 
 func (h *Handler) createManagedUser(w http.ResponseWriter, r *http.Request) {
@@ -321,6 +594,7 @@ func (h *Handler) createManagedUser(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(userItemResponse{ID: item.ID, Email: item.Email, Role: item.Role, Status: item.Status, CreatedAt: item.CreatedAt})
+	h.recordAudit(r.Context(), audit.Event{ActorUserID: h.userID(r), Action: "user.created", ResourceType: "user", ResourceID: item.ID, Metadata: map[string]string{"role": item.Role}})
 }
 
 func (h *Handler) updateManagedUser(w http.ResponseWriter, r *http.Request, id string, session userservice.Session) {
@@ -355,6 +629,7 @@ func (h *Handler) updateManagedUser(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	h.recordAudit(r.Context(), audit.Event{ActorUserID: session.UserID, Action: "user.updated", ResourceType: "user", ResourceID: id})
 }
 
 func (h *Handler) updateUserStatus(w http.ResponseWriter, r *http.Request, id string, session userservice.Session) {
@@ -378,6 +653,7 @@ func (h *Handler) updateUserStatus(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	h.recordAudit(r.Context(), audit.Event{ActorUserID: session.UserID, Action: "user.status_changed", ResourceType: "user", ResourceID: id, Metadata: map[string]string{"status": request.Status}})
 }
 
 func (h *Handler) deleteManagedUser(w http.ResponseWriter, r *http.Request, id string, session userservice.Session) {
@@ -395,6 +671,7 @@ func (h *Handler) deleteManagedUser(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+	h.recordAudit(r.Context(), audit.Event{ActorUserID: session.UserID, Action: "user.deleted", ResourceType: "user", ResourceID: id})
 }
 
 func (h *Handler) userID(r *http.Request) string {
@@ -438,6 +715,9 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+	if err := h.service.RecordClick(r.Context(), item.ID, r.UserAgent(), r.Referer()); err != nil {
+		h.logger.Error("record URL click failed", "url_id", item.ID, "error", err)
+	}
 	http.Redirect(w, r, item.OriginalURL, http.StatusFound)
 }
 
@@ -459,5 +739,70 @@ func logging(next http.Handler, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		next.ServeHTTP(w, r)
 		logger.Info("request", "method", r.Method, "path", r.URL.Path)
+	})
+}
+
+func (h *Handler) recordAudit(ctx context.Context, event audit.Event) {
+	if h.audit == nil {
+		return
+	}
+	if err := h.audit.Record(ctx, event); err != nil {
+		h.logger.Error("audit log failed", "action", event.Action, "error", err)
+	}
+}
+
+type rateLimiter struct {
+	mu      sync.Mutex
+	windows map[string]rateWindow
+}
+
+type rateWindow struct {
+	start time.Time
+	count int
+}
+
+func rateLimit(next http.Handler) http.Handler {
+	limiter := &rateLimiter{windows: make(map[string]rateWindow)}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.RemoteAddr
+		if host, _, splitErr := strings.Cut(r.RemoteAddr, ":"); splitErr {
+			key = host
+		}
+		limit := 120
+		bucket := "default"
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/auth/"):
+			limit = 20
+		case strings.HasSuffix(r.URL.Path, "/qr/preview"):
+			bucket = "qr-preview"
+			limit = 300
+		}
+		key += "|" + bucket
+		now := time.Now()
+		limiter.mu.Lock()
+		window := limiter.windows[key]
+		if window.start.IsZero() || now.Sub(window.start) >= time.Minute {
+			window = rateWindow{start: now}
+		}
+		window.count++
+		limiter.windows[key] = window
+		limited := window.count > limit
+		limiter.mu.Unlock()
+		if limited {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';")
+		next.ServeHTTP(w, r)
 	})
 }

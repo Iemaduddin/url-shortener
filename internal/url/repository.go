@@ -13,9 +13,30 @@ var ErrNotFound = errors.New("short URL not found")
 type Repository interface {
 	Create(ctx context.Context, code, originalURL, userID string) (ShortURL, error)
 	FindByCode(ctx context.Context, code string) (ShortURL, error)
-	List(ctx context.Context, userID string, admin bool) ([]ShortURL, error)
+	List(ctx context.Context, userID string, admin bool, page, pageSize int, search, status string) ([]ShortURL, int, error)
+	FindByID(ctx context.Context, id, userID string, admin bool) (ShortURL, error)
 	Disable(ctx context.Context, id, userID string, admin bool) error
 	Enable(ctx context.Context, id, userID string, admin bool) error
+	RecordClick(ctx context.Context, id, userAgent, referer string) error
+}
+
+func (r *postgresRepository) FindByID(ctx context.Context, id, userID string, admin bool) (ShortURL, error) {
+	var item ShortURL
+	err := r.db.QueryRow(ctx, `
+		SELECT s.id, s.code, s.original_url, s.created_at, s.status,
+			COUNT(c.id), MAX(c.clicked_at)
+		FROM short_urls s
+		LEFT JOIN click_events c ON c.short_url_id = s.id
+		WHERE s.id = $1::uuid AND ($2::boolean OR s.user_id = NULLIF($3, '')::uuid)
+		GROUP BY s.id
+	`, id, admin, userID).Scan(
+		&item.ID, &item.Code, &item.OriginalURL, &item.CreatedAt,
+		&item.Status, &item.TotalClicks, &item.LastClicked,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ShortURL{}, ErrNotFound
+	}
+	return item, err
 }
 
 type postgresRepository struct {
@@ -36,28 +57,55 @@ func (r *postgresRepository) Create(ctx context.Context, code, originalURL, user
 	return item, err
 }
 
-func (r *postgresRepository) List(ctx context.Context, userID string, admin bool) ([]ShortURL, error) {
+func (r *postgresRepository) List(ctx context.Context, userID string, admin bool, page, pageSize int, search, status string) ([]ShortURL, int, error) {
+	offset := (page - 1) * pageSize
 	query := `
-		SELECT id, code, original_url, created_at, status
-		FROM short_urls
-		WHERE ($1::boolean OR user_id = $2::uuid)
-		ORDER BY created_at DESC
-		LIMIT 100`
-	rows, err := r.db.Query(ctx, query, admin, userID)
+		SELECT s.id, s.code, s.original_url, s.created_at, s.status,
+			COUNT(c.id) AS total_clicks, MAX(c.clicked_at) AS last_clicked
+		FROM short_urls s
+		LEFT JOIN click_events c ON c.short_url_id = s.id
+		WHERE ($1::boolean OR s.user_id = $2::uuid)
+			AND ($3 = '' OR s.code ILIKE '%' || $3 || '%' OR s.original_url ILIKE '%' || $3 || '%')
+			AND ($4 = '' OR s.status = $4)
+		GROUP BY s.id
+		ORDER BY s.created_at DESC
+		LIMIT $5 OFFSET $6`
+	rows, err := r.db.Query(ctx, query, admin, userID, search, status, pageSize, offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 
 	items := make([]ShortURL, 0)
 	for rows.Next() {
 		var item ShortURL
-		if err := rows.Scan(&item.ID, &item.Code, &item.OriginalURL, &item.CreatedAt, &item.Status); err != nil {
-			return nil, err
+		if err := rows.Scan(&item.ID, &item.Code, &item.OriginalURL, &item.CreatedAt, &item.Status, &item.TotalClicks, &item.LastClicked); err != nil {
+			return nil, 0, err
 		}
+
 		items = append(items, item)
 	}
-	return items, rows.Err()
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	var total int
+	err = r.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM short_urls s
+		WHERE ($1::boolean OR s.user_id = $2::uuid)
+			AND ($3 = '' OR s.code ILIKE '%' || $3 || '%' OR s.original_url ILIKE '%' || $3 || '%')
+			AND ($4 = '' OR s.status = $4)
+	`, admin, userID, search, status).Scan(&total)
+	return items, total, err
+}
+
+func (r *postgresRepository) RecordClick(ctx context.Context, id, userAgent, referer string) error {
+	_, err := r.db.Exec(ctx, `
+		INSERT INTO click_events (short_url_id, user_agent, referer)
+		VALUES ($1::uuid, $2, $3)
+	`, id, userAgent, referer)
+	return err
 }
 
 func (r *postgresRepository) Disable(ctx context.Context, id, userID string, admin bool) error {

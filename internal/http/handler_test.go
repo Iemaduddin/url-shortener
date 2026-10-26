@@ -14,8 +14,9 @@ import (
 )
 
 type repositoryStub struct {
-	item urlservice.ShortURL
-	err  error
+	item        urlservice.ShortURL
+	err         error
+	recordedIDs []string
 }
 
 func (r *repositoryStub) Create(_ context.Context, code, originalURL, _ string) (urlservice.ShortURL, error) {
@@ -33,14 +34,22 @@ func (r *repositoryStub) FindByCode(_ context.Context, code string) (urlservice.
 	return r.item, nil
 }
 
-func (r *repositoryStub) List(context.Context, string, bool) ([]urlservice.ShortURL, error) {
+func (r *repositoryStub) List(context.Context, string, bool, int, int, string, string) ([]urlservice.ShortURL, int, error) {
 	if r.err != nil {
-		return nil, r.err
+		return nil, 0, r.err
 	}
+
 	if r.item.ID == "" {
-		return []urlservice.ShortURL{}, nil
+		return []urlservice.ShortURL{}, 0, nil
 	}
-	return []urlservice.ShortURL{r.item}, nil
+	return []urlservice.ShortURL{r.item}, 1, nil
+}
+
+func (r *repositoryStub) FindByID(context.Context, string, string, bool) (urlservice.ShortURL, error) {
+	if r.err != nil {
+		return urlservice.ShortURL{}, r.err
+	}
+	return r.item, nil
 }
 
 func (r *repositoryStub) Disable(context.Context, string, string, bool) error {
@@ -48,6 +57,11 @@ func (r *repositoryStub) Disable(context.Context, string, string, bool) error {
 }
 
 func (r *repositoryStub) Enable(context.Context, string, string, bool) error {
+	return r.err
+}
+
+func (r *repositoryStub) RecordClick(_ context.Context, id, _, _ string) error {
+	r.recordedIDs = append(r.recordedIDs, id)
 	return r.err
 }
 
@@ -103,6 +117,9 @@ func TestRedirectEndpointRedirectsToOriginalURL(t *testing.T) {
 	if location := response.Header().Get("Location"); location != "https://example.com" {
 		t.Fatalf("Location = %q, want original URL", location)
 	}
+	if len(repository.recordedIDs) != 1 || repository.recordedIDs[0] != repository.item.ID {
+		t.Fatalf("recorded click IDs = %v, want %q", repository.recordedIDs, repository.item.ID)
+	}
 }
 
 func TestRedirectEndpointReturnsNotFound(t *testing.T) {
@@ -115,5 +132,29 @@ func TestRedirectEndpointReturnsNotFound(t *testing.T) {
 
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestRateLimitKeepsQRPreviewBucketSeparate(t *testing.T) {
+	handler := newTestHandler(&repositoryStub{})
+
+	for i := 0; i < 300; i++ {
+		request := httptest.NewRequest(http.MethodPut, "/api/urls/11111111-1111-1111-1111-111111111111/qr/preview", nil)
+		response := httptest.NewRecorder()
+
+		handler.ServeHTTP(response, request)
+
+		if response.Code == http.StatusTooManyRequests {
+			t.Fatalf("preview request %d was rate limited before the preview limit of 300", i+1)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/urls", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code == http.StatusTooManyRequests {
+		t.Fatal("preview requests consumed the general rate limit bucket")
 	}
 }

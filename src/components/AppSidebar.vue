@@ -13,6 +13,7 @@ const emit = defineEmits<{ navigate: [page: Page] }>();
       <button type="button" :class="currentPage === 'dashboard' ? 'bg-slate-900 font-medium text-white' : 'text-slate-500 hover:bg-stone-100 hover:text-slate-900'" class="flex w-full rounded-md px-3 py-2.5 text-left" @click="emit('navigate', 'dashboard')">Dashboard</button>
       <button type="button" :class="currentPage === 'urls' ? 'bg-slate-900 font-medium text-white' : 'text-slate-500 hover:bg-stone-100 hover:text-slate-900'" class="flex w-full rounded-md px-3 py-2.5 text-left" @click="emit('navigate', 'urls')">URL List</button>
       <button v-if="role === 'admin'" type="button" :class="currentPage === 'users' ? 'bg-slate-900 font-medium text-white' : 'text-slate-500 hover:bg-stone-100 hover:text-slate-900'" class="flex w-full rounded-md px-3 py-2.5 text-left" @click="emit('navigate', 'users')">User Management</button>
+      <button v-if="role === 'admin'" type="button" :class="currentPage === 'audit' ? 'bg-slate-900 font-medium text-white' : 'text-slate-500 hover:bg-stone-100 hover:text-slate-900'" class="flex w-full rounded-md px-3 py-2.5 text-left" @click="emit('navigate', 'audit')">Audit Log</button>
     </nav>
     <div class="mt-auto border-t border-stone-200 pt-5 text-xs text-slate-500"><p>Signed in as</p><p class="mt-1 font-medium text-slate-900">{{ role }}</p></div>
   </aside>

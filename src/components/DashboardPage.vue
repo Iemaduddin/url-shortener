@@ -43,8 +43,8 @@ const emit = defineEmits<{
         <div v-else-if="urls.length === 0" class="rounded-lg bg-stone-50 px-4 py-8 text-center text-sm text-slate-500">Belum ada aktivitas. Buat URL pertamamu.</div>
         <ul v-else class="divide-y divide-stone-200">
           <li v-for="item in urls.slice(0, 5)" :key="item.id" class="py-3">
-            <div class="flex items-center justify-between gap-3"><p class="truncate text-sm font-medium text-slate-900">{{ item.short_url }}</p><span class="shrink-0 text-[10px] font-semibold uppercase tracking-wider" :class="item.status === 'active' ? 'text-green-700' : 'text-slate-400'">{{ item.status }}</span></div>
-            <div class="mt-1 flex items-center justify-between gap-3"><p class="truncate text-xs text-slate-500">{{ item.original_url }}</p><p class="shrink-0 text-xs text-slate-400">{{ new Date(item.created_at).toLocaleDateString("id-ID", { day: "numeric", month: "short" }) }}</p></div>
+            <div class="flex items-center justify-between gap-3"><div class="flex min-w-0 items-center gap-2"><p class="truncate text-sm font-medium text-slate-900">{{ item.short_url }}</p><a :href="`/qr/${item.id}.png`" download class="shrink-0 text-xs text-slate-500 hover:text-slate-900">QR</a></div><span class="shrink-0 text-[10px] font-semibold uppercase tracking-wider" :class="item.status === 'active' ? 'text-green-700' : 'text-slate-400'">{{ item.status }}</span></div>
+            <div class="mt-1 flex items-center justify-between gap-3"><p class="truncate text-xs text-slate-500">{{ item.original_url }}</p><p class="shrink-0 text-xs text-slate-400">{{ item.total_clicks }} klik</p></div>
           </li>
         </ul>
       </section>

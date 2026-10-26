@@ -8,4 +8,6 @@ type ShortURL struct {
 	OriginalURL string
 	CreatedAt   time.Time
 	Status      string
+	TotalClicks int64
+	LastClicked *time.Time
 }

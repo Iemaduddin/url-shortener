@@ -49,8 +49,16 @@ func (s *Service) FindByCode(ctx context.Context, code string) (ShortURL, error)
 	return s.repository.FindByCode(ctx, code)
 }
 
-func (s *Service) List(ctx context.Context, userID string, admin bool) ([]ShortURL, error) {
-	return s.repository.List(ctx, userID, admin)
+func (s *Service) List(ctx context.Context, userID string, admin bool, page, pageSize int, search, status string) ([]ShortURL, int, error) {
+	return s.repository.List(ctx, userID, admin, page, pageSize, search, status)
+}
+
+func (s *Service) FindByID(ctx context.Context, id, userID string, admin bool) (ShortURL, error) {
+	return s.repository.FindByID(ctx, id, userID, admin)
+}
+
+func (s *Service) FindPublicByID(ctx context.Context, id string) (ShortURL, error) {
+	return s.repository.FindByID(ctx, id, "", true)
 }
 
 func (s *Service) Disable(ctx context.Context, id, userID string, admin bool) error {
@@ -59,6 +67,10 @@ func (s *Service) Disable(ctx context.Context, id, userID string, admin bool) er
 
 func (s *Service) Enable(ctx context.Context, id, userID string, admin bool) error {
 	return s.repository.Enable(ctx, id, userID, admin)
+}
+
+func (s *Service) RecordClick(ctx context.Context, id, userAgent, referer string) error {
+	return s.repository.RecordClick(ctx, id, userAgent, referer)
 }
 
 func validateURL(value string) error {

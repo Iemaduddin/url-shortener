@@ -16,7 +16,7 @@ var ErrNotFound = errors.New("user or session not found")
 type Repository interface {
 	CreateUser(context.Context, string, string) (User, error)
 	EnsureUser(context.Context, string, string, string) (bool, error)
-	ListUsers(context.Context) ([]User, error)
+	ListUsers(context.Context, int, int, string) ([]User, int, error)
 	CreateManagedUser(context.Context, string, string, string) (User, error)
 	UpdateUser(context.Context, string, string, string, string) error
 	UpdateStatus(context.Context, string, string) error
@@ -42,10 +42,11 @@ func (r *postgresRepository) CreateUser(ctx context.Context, email, passwordHash
 	return item, err
 }
 
-func (r *postgresRepository) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := r.db.Query(ctx, `SELECT id, email, role, status, created_at FROM users ORDER BY created_at DESC`)
+func (r *postgresRepository) ListUsers(ctx context.Context, page, pageSize int, search string) ([]User, int, error) {
+	offset := (page - 1) * pageSize
+	rows, err := r.db.Query(ctx, `SELECT id, email, role, status, created_at FROM users WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR role = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`, search, pageSize, offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	defer rows.Close()
@@ -53,11 +54,16 @@ func (r *postgresRepository) ListUsers(ctx context.Context) ([]User, error) {
 	for rows.Next() {
 		var item User
 		if err := rows.Scan(&item.ID, &item.Email, &item.Role, &item.Status, &item.CreatedAt); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		users = append(users, item)
 	}
-	return users, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	var total int
+	err = r.db.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR role = $1)`, search).Scan(&total)
+	return users, total, err
 }
 
 func (r *postgresRepository) CreateManagedUser(ctx context.Context, email, passwordHash, role string) (User, error) {
